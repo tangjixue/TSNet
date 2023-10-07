@@ -1,70 +1,71 @@
 import os
+import random
 import time
 import datetime
-import logging
 
 import torch
-import torchvision
-from torch import nn
+import torchvision.transforms
 
-from src.TSNet import TSNet
-from train_utils.self_learning_joint_loss import AutomaticWeightedLoss
-from train_utils.train_and_eval import train_one_epoch, evaluate, create_lr_scheduler
+from src import TSNet
+from train_utils import train_one_epoch, evaluate, create_lr_scheduler
 from my_dataset import SSOCTADataset
+from train_utils.self_learning_joint_loss import AutomaticWeightedLoss
+import transforms as T
 
 
 def get_transform():
-    return ColorJitterAugmentation()
+    alpha = random.random()
+    beta = random.random()
+    return torchvision.transforms.ColorJitter(brightness=alpha, contrast=beta)
 
 
-def create_model(num_classes):
+def create_model():
     model = TSNet(class_num=2)
     return model
 
 
 def main(args):
-    LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-    DATE_FORMAT = "%m/%d/%Y %H:%M:%S %p"
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     batch_size = args.batch_size
+    # segmentation nun_classes + background
+    num_classes = args.num_classes + 1
 
     # 用来保存训练以及验证过程中信息
-    results_file = "ablations/models/base_model/log_base_model_{}.txt".format(
-        datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    results_file = "results{}.txt".format(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-    train_dataset = SSOCTADataset(args.data_path, train=True, transforms=get_transform()
-    val_dataset = SSOCTADataset(args.data_path, train=False, transforms=None)
+    train_dataset = SSOCTADataset(train=True, transforms=get_transform())
+    test_dataset = SSOCTADataset(train=False)
 
     num_workers = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=batch_size,
                                                num_workers=num_workers,
-                                               shuffle=True)
+                                               shuffle=True,
+                                               pin_memory=True,
+                                               collate_fn=train_dataset.collate_fn)
 
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                             batch_size=batch_size,
+    val_loader = torch.utils.data.DataLoader(test_dataset,
+                                             batch_size=1,
                                              num_workers=num_workers,
-                                             shuffle=False)
-    model = create_model(num_classes=2)
+                                             pin_memory=True,
+                                             collate_fn=test_dataset.collate_fn)
+
+    model = create_model(num_classes=num_classes)
     model.to(device)
 
     params_to_optimize = [p for p in model.parameters() if p.requires_grad]
     self_learning_loss = AutomaticWeightedLoss(num=2)
     self_learning_loss = self_learning_loss.to(device)
-    # params_to_optimize.append(self_learning_loss.params)
-
+    params_to_optimize.append(self_learning_loss.params)
     optimizer = torch.optim.SGD(
         params_to_optimize,
         lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
     )
 
-    args.amp = False
-    print('args.amp = ', args.amp)
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
 
     # 创建学习率更新策略，这里是每个step更新一次(不是每个epoch)
-    lr_scheduler = create_lr_scheduler(optimizer, len(train_loader), args.epochs, warmup=False)
+    lr_scheduler = create_lr_scheduler(optimizer, len(train_loader), args.epochs, warmup=True)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')

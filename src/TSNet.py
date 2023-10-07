@@ -1,16 +1,13 @@
+import math
 import warnings
-import torch.nn.functional as F
 from functools import partial
 
-import torchvision.models
-from timm.models.layers import to_2tuple, trunc_normal_
-import math
-from timm.models.layers import DropPath
-from torch.nn import Module
-from mmcv.cnn import ConvModule
-from torch.nn import Conv2d, UpsamplingBilinear2d
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import DropPath
+from timm.models.layers import to_2tuple, trunc_normal_
+from torch.nn import Module
 
 
 class Mlp(nn.Module):
@@ -377,158 +374,100 @@ class conv(nn.Module):
         return x
 
 
-class DownConv(nn.Module):
-    """ Down sampling Feature Maps"""
-
-    def __init__(self, channel=256):
-        super().__init__()
-
-        self.downsample = nn.Sequential(
-            # conv 尺寸不变 （256 * 256）
-            nn.Conv2d(in_channels=channel, out_channels=channel, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=channel),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel, out_channels=channel, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=channel),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel, out_channels=channel, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=channel),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel, out_channels=channel, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=channel),
-
-            # conv 尺寸减小 8 倍（32 * 32）
-            nn.Conv2d(in_channels=channel, out_channels=channel * 2, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=(channel * 2)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 2, out_channels=channel * 2, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 2)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 2, out_channels=channel * 2, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 2)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 2, out_channels=channel * 2, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 2)),
-
-            # conv 尺寸减小 8 倍（4 * 4）
-            nn.Conv2d(in_channels=channel * 2, out_channels=channel * 4, padding=1, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=(channel * 4)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 4, out_channels=channel * 4, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 4)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 4, out_channels=channel * 4, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 4)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=channel * 4, out_channels=channel * 4, padding=1, kernel_size=3, stride=2),
-            nn.BatchNorm2d(num_features=(channel * 4)),
-        )
-
-        self.avg = nn.AdaptiveAvgPool2d((1, 1))
-        # self.fc = nn.Sequential(nn.Linear(1024, 3))
+class ClsDecoder(Module):
+    def __init__(self):
+        super(ClsDecoder, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=256, out_channels=512, kernel_size=3, padding=1, stride=2)
+        self.cls_bn1 = nn.BatchNorm2d(512)
+        self.conv2 = nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=3, padding=1, stride=2)
+        self.cls_bn2 = nn.BatchNorm2d(1024)
+        self.conv3 = nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, padding=1, stride=2)
+        self.cls_bn3 = nn.BatchNorm2d(1024)
+        self.conv4 = nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, padding=1, stride=2)
+        self.cls_bn4 = nn.BatchNorm2d(1024)
+        self.cls_classifier = nn.Linear(1024, 3)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x = self.downsample(x)
-
-        x = self.avg(x)
-        # x = torch.flatten(x, 1)
-        # f = self.fc(x)
-
-        return x
-
-
-class AttentionWeight(Module):
-    def __init__(self, channels_in=1024, channels_out=4, channels_embedding=256):
-        super(AttentionWeight, self).__init__()
-        self.down_channel = nn.Sequential(
-            nn.Conv2d(in_channels=channels_in, out_channels=channels_embedding, kernel_size=3, padding=1),
-            nn.Conv2d(in_channels=channels_embedding, out_channels=channels_out, kernel_size=3, padding=1),
-            nn.Softmax(dim=1))
-
-    def forward(self, inputs):
-        outs = self.down_channel(inputs)
-        return outs
+        score = self.relu(self.conv1(x))
+        score = self.cls_bn1(score)
+        score = self.relu(self.conv2(score))
+        score = self.cls_bn2(score)
+        score = self.cls_bn3(self.relu(self.conv3(score)))
+        score = self.cls_bn4(self.relu(self.conv4(score)))
+        score_cls = F.avg_pool2d(score, kernel_size=16)
+        score_cls = score_cls.view(score_cls.size()[0], -1)
+        score_cls = self.cls_classifier(score_cls)
+        return score_cls
 
 
-class ClsPred(Module):
-    def __init__(self, in_channel=1024):
-        super(ClsPred, self).__init__()
-        self.pred = nn.Sequential(nn.Linear(in_channel, 3))
+class SegDecoder(Module):
+    def __init__(self):
+        super(SegDecoder, self).__init__()
+        self.deconv1 = nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, dilation=1, output_padding=1)
+        self.bn1 = nn.BatchNorm2d(128)
+        self.deconv2 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, dilation=1, output_padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.deconv3 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1, padding=1, output_padding=0)
+        self.bn3 = nn.BatchNorm2d(32)
+        self.deconv4 = nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1, output_padding=0)
+        self.bn4 = nn.BatchNorm2d(16)
+        self.classifier = nn.Conv2d(16, 2, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        f = torch.flatten(x, 1)
-        f = self.pred(f)
+        score = self.relu(self.deconv1(x))
+        score = self.bn1(score)
+        score = self.relu(self.deconv2(score))
+        score = self.bn2(score)
+        score = self.bn3(self.relu(self.deconv3(score)))
+        score = self.bn4(self.relu(self.deconv4(score)))
+        score = self.classifier(score)
+        return score
+
+class TaskSpecificAttentionBlock(Module):
+    def __init__(self):
+        super(TaskSpecificAttentionBlock, self).__init__()
+        self.conv_block = nn.Sequential(nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, padding=1, stride=1), nn.ReLU(inplace=True),
+                                  nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, padding=1, stride=1), nn.ReLU(inplace=True),
+                                  nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=3, padding=1, stride=1), nn.ReLU(inplace=True))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, f1, f2, f3, f4):
+        f = torch.cat((f1, f2, f3, f4), dim=1)
+        f = self.conv_block(f)
+        f = self.sigmoid(f)
+        f1 = f1 * f[:, 0:256, :, :]
+        f2 = f2 * f[:, 256:512, :, :]
+        f3 = f3 * f[:, 512:768, :, :]
+        f4 = f4 * f[:, 768:1024, :, :]
+        f = f1 + f2 + f3 + f4
         return f
 
 
-class ClsWeight1(Module):
-    def __init__(self, channel=256, embed_dim=512):
-        super(ClsWeight1, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels=channel, out_channels=embed_dim, kernel_size=1),
-                                  nn.Conv2d(in_channels=embed_dim, out_channels=channel, kernel_size=1))
-        self.softmax = nn.Softmax(dim=1)
+class TaskSpecificFusionBlock(Module):
+    def __init__(self):
+        super(TaskSpecificFusionBlock, self).__init__()
+        self.conv_block1 = nn.Sequential(nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU(),
+                                        nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU(),
+                                        nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU())
 
-    def forward(self, x):
-        f = self.conv(x)
-        f = self.softmax(f)
-        return f
+        self.conv_block2 = nn.Sequential(nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU(),
+                                        nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU(),
+                                        nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1, stride=1), nn.ReLU())
 
+    def forward(self, x, x_aug):
+        x1 = self.conv_block1(x)
+        x_aug1 = self.conv_block1(x_aug)
 
-class ClsWeight2(Module):
-    def __init__(self, channel=256, embed_dim=512):
-        super(ClsWeight2, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels=channel, out_channels=embed_dim, kernel_size=3, padding=1),
-                                  nn.Conv2d(in_channels=embed_dim, out_channels=channel, kernel_size=3, padding=1))
-        self.softmax = nn.Softmax(dim=1)
+        x2 = torch.cat((x, x_aug1), dim=1)
+        x_aug2 = torch.cat((x1, x_aug), dim=1)
 
-    def forward(self, x):
-        f = self.conv(x)
-        f = self.softmax(f)
-        return f
+        x2 = self.conv_block2(x2)
+        x_aug2 = self.conv_block2(x_aug2)
 
-
-class ClsWeight3(Module):
-    def __init__(self, channel=256, embed_dim=512):
-        super(ClsWeight3, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels=channel, out_channels=embed_dim, kernel_size=5, padding=2),
-                                  nn.Conv2d(in_channels=embed_dim, out_channels=channel, kernel_size=5, padding=2))
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        f = self.conv(x)
-        f = self.softmax(f)
-        return f
-
-
-class ClsWeight4(Module):
-    def __init__(self, channel=256, embed_dim=512):
-        super(ClsWeight4, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels=channel, out_channels=embed_dim, kernel_size=7, padding=3),
-                                  nn.Conv2d(in_channels=embed_dim, out_channels=channel, kernel_size=7, padding=3))
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        f = self.conv(x)
-        f = self.softmax(f)
-        return f
-
-
-class SegWeight(Module):
-    def __init__(self, channel=1024):
-        super(SegWeight, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels=channel, out_channels=channel, kernel_size=1),
-                                  nn.Conv2d(in_channels=channel, out_channels=channel, kernel_size=1))
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        f = self.conv(x)
-
-        f1 = self.softmax(f[:, 0:256, :, :])
-        f2 = self.softmax(f[:, 256:512, :, :])
-        f3 = self.softmax(f[:, 512:768, :, :])
-        f4 = self.softmax(f[:, 768:1024, :, :])
-
-        return f1, f2, f3, f4
+        fusion = x2 + x_aug2
+        return fusion
 
 
 class Decoder(Module):
@@ -540,139 +479,74 @@ class Decoder(Module):
         super(Decoder, self).__init__()
         self.num_classes = class_num
 
-        c1_in_channels, c2_in_channels, c3_in_channels, c4_in_channels = dims[0], dims[1], dims[2], dims[3]
-        embedding_dim = dim
+        self.seg_attention_block = TaskSpecificAttentionBlock()
+        self.cls_attention_block = TaskSpecificAttentionBlock()
 
-        self.linear_c4 = conv(input_dim=c4_in_channels, embed_dim=embedding_dim)
-        self.linear_c3 = conv(input_dim=c3_in_channels, embed_dim=embedding_dim)
-        self.linear_c2 = conv(input_dim=c2_in_channels, embed_dim=embedding_dim)
-        self.linear_c1 = conv(input_dim=c1_in_channels, embed_dim=embedding_dim)
+        self.seg_fusion_block = TaskSpecificFusionBlock()
+        self.cls_fusion_block = TaskSpecificFusionBlock()
 
-        self.weight_cls = AttentionWeight()
-        self.weight_seg = AttentionWeight()
+        self.cls_decoder = ClsDecoder()
+        self.seg_decoder = SegDecoder()
 
-        self.down_conv = DownConv(channel=256)
-        # 分割指导分类的权重
-        self.cls_weight1 = ClsWeight1()
-        self.cls_weight2 = ClsWeight2()
-        self.cls_weight3 = ClsWeight3()
-        self.cls_weight4 = ClsWeight4()
+    def forward(self, c1, c2, c3, c4, c1_aug, c2_aug, c3_aug, c4_aug):
+        # 分割特征图
+        seg_origin = self.seg_attention_block(c1, c2, c3, c4)
+        cls_origin = self.cls_attention_block(c1, c2, c3, c4)
 
-        # 分类指导分割的权重
-        self.seg_weight = SegWeight()
+        seg_aug = self.seg_attention_block(c1_aug, c2_aug, c3_aug, c4_aug)
+        cls_aug = self.seg_attention_block(c1_aug, c2_aug, c3_aug, c4_aug)
 
-        self.cls_pred = ClsPred(in_channel=1024)
+        seg = self.seg_fusion_block(seg_origin, seg_aug)
+        cls = self.cls_fusion_block(cls_origin, cls_aug)
 
-        self.linear_fuse = ConvModule(in_channels=embedding_dim * 4, out_channels=embedding_dim, kernel_size=1,
-                                      norm_cfg=dict(type='BN', requires_grad=True))
-        self.linear_fuse34 = ConvModule(in_channels=embedding_dim * 2, out_channels=embedding_dim, kernel_size=1,
-                                        norm_cfg=dict(type='BN', requires_grad=True))
-        self.linear_fuse2 = ConvModule(in_channels=embedding_dim * 2, out_channels=embedding_dim, kernel_size=1,
-                                       norm_cfg=dict(type='BN', requires_grad=True))
-        self.linear_fuse1 = ConvModule(in_channels=embedding_dim * 2, out_channels=embedding_dim, kernel_size=1,
-                                       norm_cfg=dict(type='BN', requires_grad=True))
+        seg_pred = self.seg_decoder(seg)
+        cls_pred = self.cls_decoder(cls)
+        return seg_pred, cls_pred
 
-        self.linear_pred = Conv2d(embedding_dim, self.num_classes, kernel_size=1)
-        self.dropout = nn.Dropout(0.1)
+
+class ResizeBlock(nn.Module):
+    def __init__(self):
+        super(ResizeBlock, self).__init__()
+        self.linear_c4 = conv(input_dim=512, embed_dim=256)
+        self.linear_c3 = conv(input_dim=320, embed_dim=256)
+        self.linear_c2 = conv(input_dim=128, embed_dim=256)
+        self.linear_c1 = conv(input_dim=64, embed_dim=256)
 
     def forward(self, inputs):
         c1, c2, c3, c4 = inputs
-        n, _, h, w = c4.shape
-
-        # 全局特征的变换，全部都变换到 H * W * C = 256 * 256 * 256
-        _c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(n, -1, c4.shape[2], c4.shape[3])
-        _c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(n, -1, c3.shape[2], c3.shape[3])
-        _c2 = self.linear_c2(c2).permute(0, 2, 1).reshape(n, -1, c2.shape[2], c2.shape[3])
-        _c1 = self.linear_c1(c1).permute(0, 2, 1).reshape(n, -1, c1.shape[2], c1.shape[3])
+        _c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(1, -1, c4.shape[2], c4.shape[3])
+        _c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(1, -1, c3.shape[2], c3.shape[3])
+        _c2 = self.linear_c2(c2).permute(0, 2, 1).reshape(1, -1, c2.shape[2], c2.shape[3])
+        _c1 = self.linear_c1(c1).permute(0, 2, 1).reshape(1, -1, c1.shape[2], c1.shape[3])
 
         _c4 = resize(_c4, size=c1.size()[2:], mode='bilinear', align_corners=False)
         _c3 = resize(_c3, size=c1.size()[2:], mode='bilinear', align_corners=False)
         _c2 = resize(_c2, size=c1.size()[2:], mode='bilinear', align_corners=False)
 
-        # 将得到的特征图抽取出来，进行拼接用于获得权重特征图
-        feature_map = torch.cat((_c1, _c2, _c3, _c4), dim=1)
-        seg_attn = self.weight_seg(feature_map)
-        cls_attn = self.weight_cls(feature_map)
-
-        # 用于分类的特征图
-        c4_cls = torch.unsqueeze(cls_attn[:, 3, :, :], dim=1).repeat_interleave(256, dim=1) * _c4
-        c3_cls = torch.unsqueeze(cls_attn[:, 2, :, :], dim=1).repeat_interleave(256, dim=1) * _c3
-        c2_cls = torch.unsqueeze(cls_attn[:, 1, :, :], dim=1).repeat_interleave(256, dim=1) * _c2
-        c1_cls = torch.unsqueeze(cls_attn[:, 0, :, :], dim=1).repeat_interleave(256, dim=1) * _c1
-
-        # 用于分割的特征图
-        c4_seg = torch.unsqueeze(seg_attn[:, 3, :, :], dim=1).repeat_interleave(256, dim=1) * _c4
-        c3_seg = torch.unsqueeze(seg_attn[:, 2, :, :], dim=1).repeat_interleave(256, dim=1) * _c3
-        c2_seg = torch.unsqueeze(seg_attn[:, 1, :, :], dim=1).repeat_interleave(256, dim=1) * _c2
-        c1_seg = torch.unsqueeze(seg_attn[:, 0, :, :], dim=1).repeat_interleave(256, dim=1) * _c1
-
-        # 分割预测分支，输出 1 x 256 x 256 x 256
-        L34 = self.linear_fuse34(torch.cat([c4_seg, c3_seg], dim=1))
-        L2 = self.linear_fuse2(torch.cat([L34, c2_seg], dim=1))
-        seg_feature = self.linear_fuse1(torch.cat([L2, c1_seg], dim=1))
-
-        # 分类预测分支，输出 1 x 1024 x 1 x 1
-        cls_feature = self.down_conv(c1_cls + c2_cls + c3_cls + c4_cls)
-
-        # 分割的 feature map 指导分类
-        c1_cls += seg_feature * self.cls_weight1(seg_feature)
-        c2_cls += seg_feature * self.cls_weight2(seg_feature)
-        c3_cls += seg_feature * self.cls_weight3(seg_feature)
-        c4_cls += seg_feature * self.cls_weight4(seg_feature)
-
-        # 分类的 feature map 指导分割
-        seg_weight1, seg_weight2, seg_weight3, seg_weight4 = self.seg_weight(cls_feature)
-        c1_seg += seg_weight1 * c1_seg
-        c2_seg += seg_weight2 * c2_seg
-        c3_seg += seg_weight3 * c3_seg
-        c4_seg += seg_weight4 * c4_seg
-
-        # 使用更新后的分割和分类 feature map
-        L34 = self.linear_fuse34(torch.cat([c4_seg, c3_seg], dim=1))
-        L2 = self.linear_fuse2(torch.cat([L34, c2_seg], dim=1))
-        seg_feature = self.linear_fuse1(torch.cat([L2, c1_seg], dim=1))
-
-        # 分类预测分支，输出 1 x 1024 x 1 x 1
-        cls_feature = self.down_conv(c1_cls + c2_cls + c3_cls + c4_cls)
-        cls_outcome = self.cls_pred(cls_feature)
-
-        seg_feature = self.dropout(seg_feature)
-        seg_outcome = self.linear_pred(seg_feature)
-
-        return seg_outcome, cls_outcome
+        return _c1, _c2, _c3, _c4
 
 
 class TSNet(nn.Module):
-    def __init__(self, class_num=2, **kwargs):
+    def __init__(self, class_num=2):
         super(TSNet, self).__init__()
         self.class_num = class_num
         self.backbone = mit_b2()
-        self.decode_head = Decoder(dims=[64, 128, 320, 512], dim=256, class_num=class_num)
-        # self._init_weights()  # load pretrain
+        self.resize_block = ResizeBlock()
+        self.decoder = Decoder(dims=[64, 128, 320, 512], dim=256, class_num=class_num)
 
-    def forward(self, x):
+    def forward(self, x, x_aug):
         features = self.backbone(x)
-
-        features, c4_down_conv = self.decode_head(features)
-        up = UpsamplingBilinear2d(scale_factor=4)
-        features = up(features)
-        return {"out": features, "cls": c4_down_conv}
-
-#     def _init_weights(self):
-#         pretrained_dict = torch.load('/mnt/DATA-1/DATA-2/Feilong/scformer/models/mit/mit_b2.pth')
-#         model_dict = self.backbone.state_dict()
-#         pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dicdt}
-#         model_dict.update(pretrained_dict)
-#         self.backbone.load_state_dict(model_dict)
-#         print("successfully loaded!!!!")
+        features_aug = self.backbone(x_aug)
+        c1, c2, c3, c4 = self.resize_block(features)
+        c1_aug, c2_aug, c3_aug, c4_aug = self.resize_block(features_aug)
+        seg_output, cls_output = self.decoder(c1, c2, c3, c4, c1_aug, c2_aug, c3_aug, c4_aug)
+        return {"seg": seg_output, "cls": cls_output}
 
 
 if __name__ == '__main__':
     print('hello, python!')
-
     model = TSNet(class_num=2)
     x = torch.ones(size=(1, 1, 1024, 1024))
-    y = model(x)
-    print(y['out'].shape, y['cls'].shape)
-
-
+    x_aug = torch.ones(size=(1, 1, 1024, 1024))
+    y = model(x, x_aug)
+    print(y['seg'].shape, y['cls'].shape)

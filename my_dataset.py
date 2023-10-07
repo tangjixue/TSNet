@@ -6,65 +6,93 @@ import SimpleITK as sitk
 import pandas as pd
 import torch
 
-
 def readNii(path):
     img = sitk.ReadImage(path)
     # 查看图片深度和尺寸
     data = sitk.GetArrayFromImage(img)
     return np.array(data)
 
-
-class SSOCTADataset(Dataset):
-    def __init__(self, root: str, train: bool, test: bool, transforms=None):
-        super(SSOCTADataset, self).__init__()
-
-        data_root = os.path.join(root)
-        assert os.path.exists(data_root), f'path {data_root} does not exist.'
-        quality_train = pd.read_csv('data/train/most_1_type_and_excellent_quality_train.txt', header=None)
-        quality_train = np.array(quality_train).reshape(-1)
-
-        quality_test = pd.read_csv('data/test/most_1_type_and_excellent_quality_test.txt', header=None)
-        quality_test = np.array(quality_test).reshape(-1)
-
+class DriveDataset(Dataset):
+    def __init__(self, root: str, train: bool, transforms=None):
+        super(DriveDataset, self).__init__()
+        self.flag = "training" if train else "test"
+        data_root = os.path.join(root, "DRIVE", self.flag)
+        assert os.path.exists(data_root), f"path '{data_root}' does not exists."
         self.transforms = transforms
-        # 测试情况下的数据集
-        if test:
-            # self.images = readNii(os.path.join(data_root, 'test', 'most_1_type_image_test.nii.gz'))
-            # self.masks = readNii(os.path.join(data_root, 'test', 'most_1_type_mask_test.nii.gz'))
-            # self.label = quality_test
-            self.images = readNii('data/test/image.nii.gz')
-            self.masks = readNii('data/test/mask.nii.gz')
-            self.label = quality_test
-        # 训练情况下的数据集
-        elif train:
-            # self.images = readNii(os.path.join(data_root, 'train', 'most_1_type_image_train.nii.gz'))
-            # self.masks = readNii(os.path.join(data_root, 'train', 'most_1_type_mask_train.nii.gz'))
-            # self.label = quality_train
-            self.images = readNii('data/train/image.nii.gz')
-            self.masks = readNii('data/train/mask.nii.gz')
-            self.label = quality_train
+        img_names = [i for i in os.listdir(os.path.join(data_root, "images")) if i.endswith(".tif")]
+        self.img_list = [os.path.join(data_root, "images", i) for i in img_names]
+        self.manual = [os.path.join(data_root, "1st_manual", i.split("_")[0] + "_manual1.gif")
+                       for i in img_names]
+        # check files
+        for i in self.manual:
+            if os.path.exists(i) is False:
+                raise FileNotFoundError(f"file {i} does not exists.")
+
+        self.roi_mask = [os.path.join(data_root, "mask", i.split("_")[0] + f"_{self.flag}_mask.gif")
+                         for i in img_names]
+        # check files
+        for i in self.roi_mask:
+            if os.path.exists(i) is False:
+                raise FileNotFoundError(f"file {i} does not exists.")
 
     def __getitem__(self, idx):
-        img = Image.fromarray(self.images[idx, :, :])
-        mask = Image.fromarray(self.masks[idx, :, :])
-        category = torch.tensor(self.label[idx])
+        img = Image.open(self.img_list[idx]).convert('RGB')
+        manual = Image.open(self.manual[idx]).convert('L')
+        manual = np.array(manual) / 255
+        roi_mask = Image.open(self.roi_mask[idx]).convert('L')
+        roi_mask = 255 - np.array(roi_mask)
+        mask = np.clip(manual + roi_mask, a_min=0, a_max=255)
+
+        # 这里转回PIL的原因是，transforms中是对PIL数据进行处理
+        mask = Image.fromarray(mask)
 
         if self.transforms is not None:
-            img = self.transforms(img)
-            mask = self.transforms(mask)
+            img, mask = self.transforms(img, mask)
 
-        return img, mask, category
+        return img, mask
 
     def __len__(self):
-        return len(self.images)
+        return len(self.img_list)
 
     @staticmethod
     def collate_fn(batch):
         images, targets = list(zip(*batch))
-        batched_images = cat_list(images, fill_value=0)
+        batched_imgs = cat_list(images, fill_value=0)
         batched_targets = cat_list(targets, fill_value=255)
-        return batched_images, batched_targets
+        return batched_imgs, batched_targets
 
+
+class SSOCTADataset(Dataset):
+    def __init__(self, train, transforms=None):
+        self.transforms = transforms
+        # 训练集
+        if train:
+            self.images = readNii('data/train/image.nii.gz')
+            self.masks = readNii('data/train/mask.nii.gz')
+            DR_level_train = pd.read_csv('data/train/DR_level_train.txt', header=None)
+            DR_level_train = np.array(DR_level_train).reshape(-1)
+            self.label = DR_level_train
+        # 测试集
+        else:
+            self.images = readNii('data/test/image.nii.gz')
+            self.masks = readNii('data/test/mask.nii.gz')
+            DR_level_test = pd.read_csv('data/test/DR_level_test.txt', header=None)
+            DR_level_test = np.array(DR_level_test).reshape(-1)
+            self.label = DR_level_test
+
+    def __getitem__(self, idx):
+        img = Image.fromarray(self.images[idx, :, :])
+        mask = Image.fromarray(self.masks[idx, :, :])
+
+        category = torch.tensor(self.label[idx])
+        if self.transforms is not None:
+            img_aug = self.transforms(img)
+        else:
+            img_aug = img
+        return img, img_aug, mask, category
+
+    def __len__(self):
+        return len(self.images)
 
 def cat_list(images, fill_value=0):
     max_size = tuple(max(s) for s in zip(*[img.shape for img in images]))
@@ -73,3 +101,4 @@ def cat_list(images, fill_value=0):
     for img, pad_img in zip(images, batched_imgs):
         pad_img[..., :img.shape[-2], :img.shape[-1]].copy_(img)
     return batched_imgs
+
